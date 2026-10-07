@@ -16,7 +16,6 @@ Variables de entorno:
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID   obligatorias
   WATCH_HOUSE   "Apellido:Nombre" separados por coma. Por defecto "Pelosi:Nancy"
   WATCH_OGE     palabra a buscar en el indice de OGE. Por defecto "Trump". Vacio = desactivar
-  OGE_INDEX_URL por defecto el indice PAS+Index de extapps2.oge.gov
   STATE_FILE    por defecto state.json
 Solo usa la libreria estandar de Python 3.8+.
 """
@@ -35,7 +34,6 @@ import zipfile
 
 HOUSE = "https://disclosures-clerk.house.gov"
 OGE_BASE = "https://extapps2.oge.gov"
-OGE_INDEX_URL = os.environ.get("OGE_INDEX_URL", OGE_BASE + "/201/Presiden.nsf/PAS+Index?OpenView&Count=3000")
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 WATCH_HOUSE = [p.strip().split(":") for p in os.environ.get("WATCH_HOUSE", "Pelosi:Nancy").split(",") if p.strip()]
 WATCH_OGE = os.environ.get("WATCH_OGE", "Trump").strip()
@@ -60,7 +58,7 @@ def telegram(text):
 
 
 def years():
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(dt.timezone.utc)
     return [now.year - 1, now.year] if now.month == 1 else [now.year]
 
 
@@ -126,28 +124,57 @@ def check_house():
 
 
 # ---------- OGE (Trump) ----------
+# La tabla publica de OGE se llena desde este servicio (el mismo que usa su pagina web).
 
-def parse_oge(page, word):
-    """Enlaces del indice de OGE cuya fila menciona la palabra buscada. Devuelve {clave: info}."""
+OGE_API = OGE_BASE + "/201/Presiden.nsf/API.xsp/v3/rest"
+OGE_COLUMNS = ["docDate", "title", "type", "name", "agency", "level"]
+
+
+def oge_query(search, start=0, length=100):
+    p = [("draw", "1")]
+    for i, c in enumerate(OGE_COLUMNS):
+        p += [("columns[%d][data]" % i, c), ("columns[%d][name]" % i, ""),
+              ("columns[%d][searchable]" % i, "true"), ("columns[%d][orderable]" % i, "true"),
+              ("columns[%d][search][value]" % i, ""), ("columns[%d][search][regex]" % i, "false")]
+    p += [("order[0][column]", "0"), ("order[0][dir]", "desc"), ("start", str(start)), ("length", str(length)),
+          ("search[value]", search), ("search[regex]", "false"), ("_", str(int(time.time() * 1000)))]
+    req = urllib.request.Request(OGE_API + "?" + urllib.parse.urlencode(p), headers=dict(
+        UA, Accept="application/json, text/javascript, */*", **{"X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.oge.gov/web/oge.nsf/Officials%20Individual%20Disclosures%20Search%20Collection"}))
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def clean(v):
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", str(v)))).strip()
+
+
+def parse_oge(payload, word):
+    """Filas del servicio de OGE que mencionan la palabra. Devuelve {clave: info}."""
+    rows = payload.get("data") if isinstance(payload, dict) else payload
     out = {}
-    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", page, flags=re.S | re.I) or [page]:
-        text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", row))).strip()
-        for href in re.findall(r'href="([^"]+)"', row, flags=re.I):
-            href = html.unescape(href)
-            if word.lower() not in (text + " " + urllib.parse.unquote(href)).lower():
-                continue
-            if "opendocument" not in href.lower() and "$file" not in href.lower():
-                continue
-            url = urllib.parse.urljoin(OGE_BASE + "/201/Presiden.nsf/", href)
-            m = re.search(r"/([0-9A-Fa-f]{32})", url)
-            key = m.group(1).upper() if m else url
-            out[key] = {"name": text[:160] or word, "date": "", "url": url}
+    for row in rows or []:
+        vals = list(row.values()) if isinstance(row, dict) else list(row)
+        raw = " ".join(str(v) for v in vals if v is not None)
+        if word.lower() not in urllib.parse.unquote(raw).lower():
+            continue
+        get = (lambda k: clean(row.get(k, ""))) if isinstance(row, dict) else (lambda k: "")
+        m = re.search(r'href=[\'"]([^\'"]+)', raw) or re.search(r'((?:https?:)?/[^\s\'"<>]*(?:\$FILE|\.pdf)[^\s\'"<>]*)', raw, flags=re.I)
+        url = urllib.parse.urljoin(OGE_BASE + "/201/Presiden.nsf/", html.unescape(m.group(1))) if m else \
+            "https://www.oge.gov/web/oge.nsf/Officials%20Individual%20Disclosures%20Search%20Collection"
+        label = " | ".join(x for x in (get("docDate"), get("type"), get("title"), get("name")) if x) or clean(raw)[:200]
+        h = re.search(r"([0-9A-Fa-f]{32})", raw)
+        key = h.group(1).upper() if h else label
+        out[key] = {"name": label[:300], "date": get("docDate"), "url": url.replace(" ", "%20")}
     return out
 
 
 def check_oge():
-    page = fetch(OGE_INDEX_URL, timeout=90).decode("utf-8", "replace")
-    return parse_oge(page, WATCH_OGE)
+    found = parse_oge(oge_query(WATCH_OGE), WATCH_OGE)
+    if not found:   # si el buscador del servicio no filtra, revisar las filas mas recientes
+        for start in (0, 100, 200):
+            found.update(parse_oge(oge_query("", start), WATCH_OGE))
+    return found
 
 
 # ---------- Estado y ciclo ----------
@@ -174,7 +201,7 @@ def run_once():
     state = load_state()
     first_run = "house" not in state
     state.setdefault("house", []); state.setdefault("oge", []); state.setdefault("fails", {})
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(dt.timezone.utc)
     stamp = now.strftime("%Y-%m-%d %H:%M UTC")
 
     def track_failure(key, label, detail):
@@ -210,6 +237,9 @@ def run_once():
                 raise RuntimeError("el indice no devolvio ninguna fila con '%s'" % WATCH_OGE)
             state["fails"]["oge"] = 0
             new = [k for k in found_oge if k not in state["oge"]]
+            if not first_run and not state["oge"]:
+                telegram("Vigilancia de %s en OGE activa: %d documentos ya publicados (no se avisan). "
+                         "A partir de ahora te aviso solo de lo nuevo." % (WATCH_OGE, len(found_oge)))
             if not first_run and state["oge"]:
                 for k in sorted(new):
                     v = found_oge[k]
@@ -226,7 +256,7 @@ def run_once():
                  "A partir de ahora te aviso solo de lo nuevo."
                  % (names, len(state["house"]) if ok else "no pude leer el sitio",
                     WATCH_OGE or "desactivado",
-                    ("%d documentos ya publicados" % oge_count) if oge_count else "no pude leer el indice, revisa OGE_INDEX_URL"))
+                    ("%d documentos ya publicados" % oge_count) if oge_count else "no pude leer el indice"))
 
     state["heartbeat"] = "%d-W%02d" % now.isocalendar()[:2]   # cambia cada semana: mantiene activo el repositorio
     save_state(state)
