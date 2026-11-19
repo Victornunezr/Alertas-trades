@@ -1,7 +1,7 @@
 {
  "fails": {
   "house": 0,
-  "oge": 1
+  "oge": 0
  },
  "heartbeat": "2026-W47",
  "house": [
@@ -20,6 +20,7 @@
   "2023-07-08T04:33:07 | Presidential Candidate ( Request this Document ) | Presidential Candidate | Trump, Donald J",
   "2023-10-18T04:33:25 | Presidential Candidate ( Request this Document ) | Presidential Candidate | Trump, Donald J",
   "2024-08-23T04:21:52 | Presidential Candidate ( Request this Document ) | Presidential Candidate | Trump, Donald J",
+  "20A6220DE9740AF085258EB400334364",
   "268353939B7DACB585258D81003471B1",
   "2BF91F890F718ACB85258E5B002DE16B",
   "2C89623DC721F62585258D430031A32A",
